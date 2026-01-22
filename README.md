@@ -16,11 +16,6 @@ Live demo: [https://userdevtec.github.io/turtle-lab](https://github.com/UserDevt
 - PowerBI export genereren als nieuwe download.
 - Logboek met acties en fouten.
 
-## Starten
-1. `npm install`
-2. `npm run dev`
-3. Open de lokale URL die Vite toont.
-
 ## Gebruik
 1. Upload het dashboard (`Afwijkingen dashboard.xlsm`).
 2. Upload de database (`Afwijkingen database.xlsx`).
