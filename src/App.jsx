@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react'
+import ExcelJS from 'exceljs'
 import * as XLSX from 'xlsx'
 import './App.css'
 
@@ -59,6 +60,77 @@ const buildEmailDraft = (stationLabel) => {
     'Ik hoop jullie hiermee voldoende te hebben geinformeerd. Bij vragen hoor ik het graag.',
   ].join('\n')
   return { subject, body }
+}
+
+const buildTimestamp = () => {
+  const now = new Date()
+  const pad = (value) => String(value).padStart(2, '0')
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}_${pad(
+    now.getHours()
+  )}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`
+}
+
+const computeColumnWidths = (headers, rows, metaRows) => {
+  const widths = headers.map(() => 10)
+  const applyRow = (row) => {
+    row.forEach((value, index) => {
+      if (index >= widths.length) return
+      const length = String(value ?? '').length
+      const next = Math.min(Math.max(length + 2, 10), 60)
+      widths[index] = Math.max(widths[index], next)
+    })
+  }
+  headers.forEach((value, index) => {
+    const length = String(value ?? '').length
+    widths[index] = Math.max(widths[index], Math.min(Math.max(length + 2, 10), 60))
+  })
+  rows.forEach(applyRow)
+  metaRows.forEach(applyRow)
+  return widths
+}
+
+const styleMetaBlock = (sheet) => {
+  for (let rowIndex = 1; rowIndex <= 3; rowIndex += 1) {
+    const row = sheet.getRow(rowIndex)
+    row.height = 18
+    const labelCell = row.getCell(1)
+    labelCell.font = { bold: true }
+    labelCell.alignment = { vertical: 'middle' }
+    const valueCell = row.getCell(2)
+    valueCell.alignment = { vertical: 'middle' }
+  }
+}
+
+const styleTableHeader = (sheet, columnCount) => {
+  const headerRow = sheet.getRow(4)
+  headerRow.height = 20
+  for (let colIndex = 1; colIndex <= columnCount; colIndex += 1) {
+    const cell = headerRow.getCell(colIndex)
+    cell.font = { bold: true, color: { argb: 'FFFFFFFF' } }
+    cell.alignment = { vertical: 'middle', wrapText: true }
+    cell.fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FF630D80' },
+    }
+  }
+}
+
+const styleTableRows = (sheet, rowCount, columnCount) => {
+  const lightFill = { argb: 'FFC1E62E' }
+  const darkFill = { argb: 'FFBAFF33' }
+  for (let rowIndex = 5; rowIndex < 5 + rowCount; rowIndex += 1) {
+    const row = sheet.getRow(rowIndex)
+    const fillColor = rowIndex % 2 === 0 ? darkFill : lightFill
+    for (let colIndex = 1; colIndex <= columnCount; colIndex += 1) {
+      const cell = row.getCell(colIndex)
+      cell.fill = {
+        type: 'pattern',
+        pattern: 'solid',
+        fgColor: fillColor,
+      }
+    }
+  }
 }
 
 const setCellValue = (sheet, rowIndex, colIndex, value) => {
@@ -311,6 +383,105 @@ function App() {
     }
   }
 
+  const downloadDashboardExport = async () => {
+    if (!achterstalligRows.length && !conceptRows.length && !actiehouders.length) {
+      addLog('Geen data om te exporteren.', 'error')
+      return
+    }
+    const headersAchterstallig = [
+      'Afw. Code',
+      'Afwijking Titel',
+      'Maatregel Code',
+      'Maatregel',
+      'Status',
+      'Actiehouder',
+      'Geplande datum klaar',
+      'Opmerking',
+    ]
+    const exportMetaRows = [
+      ['Project', station || ''],
+      ['Type', 'Afwijkingen overzicht'],
+      ['Datum DB', new Date().toLocaleString('nl-NL')],
+    ]
+    const achterstalligData = achterstalligRows.map((row) => [
+      row.code,
+      row.titel,
+      row.maatregelCode,
+      row.maatregel,
+      row.status,
+      row.actiehouder,
+      row.geplandeDatum,
+      row.opmerking,
+    ])
+    const headersConcept = [
+      'Afw. Code',
+      'Afwijking Titel',
+      'Status',
+      'Opsteller',
+      'Geplande datum klaar',
+    ]
+    const conceptData = conceptRows.map((row) => [
+      row.code,
+      row.titel,
+      row.status,
+      row.opsteller,
+      row.geplandeDatum,
+    ])
+    const actiehouderRows = actiehouders.map((name) => [name])
+
+    const workbook = new ExcelJS.Workbook()
+    workbook.creator = 'afwijkingen-lab'
+
+    const buildSheet = (name, headers, rows, tableName) => {
+      const sheet = workbook.addWorksheet(name)
+      exportMetaRows.forEach((row) => sheet.addRow(row))
+      const tableRows =
+        rows && rows.length ? rows : [headers.map(() => '')]
+      sheet.addTable({
+        name: tableName,
+        ref: 'A4',
+        headerRow: true,
+        totalsRow: false,
+        style: { theme: 'TableStyleLight1', showRowStripes: false },
+        columns: headers.map((header) => ({ name: header })),
+        rows: tableRows,
+      })
+      styleMetaBlock(sheet)
+      styleTableHeader(sheet, headers.length)
+      styleTableRows(sheet, tableRows.length, headers.length)
+      const widths = computeColumnWidths(headers, rows, exportMetaRows)
+      sheet.columns = headers.map((_, index) => ({
+        width: widths[index],
+      }))
+      sheet.views = [{ state: 'frozen', ySplit: 4, topLeftCell: 'A5' }]
+    }
+
+    buildSheet(
+      'Afwijking achterstallig',
+      headersAchterstallig,
+      achterstalligData,
+      'AchterstalligTable'
+    )
+    buildSheet('Afwijking concept', headersConcept, conceptData, 'ConceptTable')
+    buildSheet('Actiehouders', ['Actiehouder'], actiehouderRows, 'ActiehoudersTable')
+
+    const filename = `Afwijkingen_dashboard_export_${buildTimestamp()}.xlsx`
+    const buffer = await workbook.xlsx.writeBuffer()
+    const blob = new Blob([buffer], {
+      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = filename
+    link.rel = 'noopener'
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+    addLog(`Dashboard export gedownload: ${filename}`)
+  }
+
   const handleDrop = (target) => async (event) => {
     event.preventDefault()
     const file = event.dataTransfer.files?.[0] || null
@@ -349,7 +520,7 @@ function App() {
     <div className="app">
       <header className="hero">
         <div>
-          <p className="eyebrow">Afwijkingen workflow</p>
+          <p className="eyebrow">Afwijkingen Workflow Lab</p>
           <h1>Afwijkingen dashboard lab</h1>
           <p className="subtitle">
             Upload het dashboard, de database en het overzicht. Daarna kun je data ophalen,
@@ -482,6 +653,9 @@ function App() {
           >
             {busyAction === 'powerbi' ? 'PowerBI data...' : 'PowerBI data'}
           </button>
+          <button className="ghost" type="button" onClick={() => void downloadDashboardExport()}>
+            Dashboard export
+          </button>
         </div>
         <div className="output-cards">
           <div className="stat-card">
@@ -547,30 +721,34 @@ function App() {
                 <h3>Achterstallig</h3>
                 <span className="meta">{achterstalligRows.length} rijen</span>
               </div>
-              <div className="table-scroll">
-                {achterstalligRows.length ? (
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Code</th>
-                        <th>Afwijking titel</th>
-                        <th>Maatregel</th>
-                        <th>Actiehouder</th>
-                        <th>Geplande datum</th>
-                        <th>Opmerking</th>
+            <div className="table-scroll">
+              {achterstalligRows.length ? (
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Code</th>
+                      <th>Afwijking titel</th>
+                      <th>Maatregel code</th>
+                      <th>Maatregel</th>
+                      <th>Status</th>
+                      <th>Actiehouder</th>
+                      <th>Geplande datum</th>
+                      <th>Opmerking</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {achterstalligRows.map((row, index) => (
+                      <tr key={`achterstallig-${index}`}>
+                        <td>{row.code}</td>
+                        <td>{row.titel}</td>
+                        <td>{row.maatregelCode}</td>
+                        <td>{row.maatregel}</td>
+                        <td>{row.status}</td>
+                        <td>{row.actiehouder}</td>
+                        <td>{formatDate(row.geplandeDatum)}</td>
+                        <td>{row.opmerking}</td>
                       </tr>
-                    </thead>
-                    <tbody>
-                      {achterstalligRows.map((row, index) => (
-                        <tr key={`achterstallig-${index}`}>
-                          <td>{row.code}</td>
-                          <td>{row.titel}</td>
-                          <td>{row.maatregel}</td>
-                          <td>{row.actiehouder}</td>
-                          <td>{formatDate(row.geplandeDatum)}</td>
-                          <td>{row.opmerking}</td>
-                        </tr>
-                      ))}
+                    ))}
                     </tbody>
                   </table>
                 ) : (
