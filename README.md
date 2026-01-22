@@ -1,6 +1,12 @@
-# afwijkingen-lab
+# Afwijkingen Lab
+
+[![Deploy to GitHub Pages](https://github.com/UserDevtec/afwijkingen-lab/actions/workflows/deploy.yml/badge.svg)](https://github.com/UserDevtec/afwijkingen-lab/actions/workflows/deploy.yml)
 
 Dashboard voor het verwerken van afwijkingenbestanden (dashboard, database, overzicht) in de browser.
+
+Live demo: [https://userdevtec.github.io/turtle-lab](https://github.com/UserDevtec/afwijkingen-lab)
+
+<img width="1845" height="1028" alt="image" src="https://github.com/user-attachments/assets/c69d13cd-3f29-4fe4-b769-e6dc4e179b81" />
 
 ## Features
 - Uploaden via klik of drag-and-drop van de drie Excel-bestanden.
