@@ -6,7 +6,7 @@ Dashboard voor het verwerken van afwijkingenbestanden (dashboard, database, over
 
 Live demo: [https://userdevtec.github.io/turtle-lab](https://github.com/UserDevtec/afwijkingen-lab)
 
-<img width="1845" height="1028" alt="image" src="https://github.com/user-attachments/assets/c69d13cd-3f29-4fe4-b769-e6dc4e179b81" />
+<img width="1844" height="1030" alt="image" src="https://github.com/user-attachments/assets/ad7ee305-eeec-4a89-9b8c-3fee547001a0" />
 
 ## Features
 - Uploaden via klik of drag-and-drop van de drie Excel-bestanden.
