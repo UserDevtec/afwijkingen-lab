@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import ExcelJS from 'exceljs'
 import * as XLSX from 'xlsx'
 import './App.css'
@@ -52,7 +52,7 @@ const buildEmailDraft = (stationLabel) => {
   const station = stationLabel?.trim() || 'Station'
   const subject = `${station} - Afwijkingen maatregelen - deadlines week ${weekNumber}-${year}`
   const body = [
-    'Beste collega s,',
+    "Beste collega's,",
     '',
     "Bij deze het overzicht van de maatregelen horende bij afwijkingen waarvoor de implementatiedatum verstreken is (zie de 'Geplande datum klaar' kolom).",
     "Ik ontvang graag een status update omtrent deze maatregelen. De updates die mij bekend zijn staan onder de 'Opmerkingen' kolom.",
@@ -169,6 +169,15 @@ function App() {
   const [powerBiReady, setPowerBiReady] = useState(false)
   const [dragTarget, setDragTarget] = useState('')
   const [activePanel, setActivePanel] = useState('results')
+  const [lastEmailStation, setLastEmailStation] = useState('')
+  const [showHelp, setShowHelp] = useState(false)
+  const [helpItems, setHelpItems] = useState([])
+  const [isHelpCompact, setIsHelpCompact] = useState(false)
+  const helpRafRef = useRef(null)
+  const uploadsRef = useRef(null)
+  const actionsRef = useRef(null)
+  const outputRef = useRef(null)
+  const toggleRowRef = useRef(null)
 
   const summaryStats = useMemo(
     () => ({
@@ -251,19 +260,20 @@ function App() {
               : 'Geen actie vereist'
           : 'Geen datum'
 
-        if (status === 'Vigerend' && opmerking !== 'Geen actie vereist') {
+        const actiehouderValue = String(row[colActiehouder] ?? '').trim()
+        if (status === 'Vigerend' && opmerking !== 'Geen actie vereist' && actiehouderValue) {
           achterstallig.push({
             code: row[colCode],
             titel: row[colTitel],
             maatregelCode: row[colMaatregelCode],
             maatregel: row[colMaatregel],
             status,
-            actiehouder: row[colActiehouder],
+            actiehouder: actiehouderValue,
             geplandeDatum,
             opmerking,
           })
-          if (row[colActiehouder]) {
-            actiehouderSet.add(String(row[colActiehouder]))
+          if (actiehouderValue) {
+            actiehouderSet.add(actiehouderValue)
           }
         }
 
@@ -295,82 +305,19 @@ function App() {
   const runEmailDraft = () => {
     const draft = buildEmailDraft(station)
     setEmailDraft(draft)
+    setLastEmailStation(station)
     addLog('Email concept gegenereerd.')
   }
 
   const runPowerBiExport = async () => {
     if (!databaseFile || !overzichtFile) return
     setBusyAction('powerbi')
-    addLog('PowerBI data voorbereiden gestart.')
-    try {
-      const dbWb = await readWorkbook(databaseFile)
-      const ovWb = await readWorkbook(overzichtFile)
-      const dbSheet =
-        dbWb.Sheets['Database'] || dbWb.Sheets[dbWb.SheetNames[0]] || null
-      const ovSheet = ovWb.Sheets[ovWb.SheetNames[0]]
-      if (!dbSheet || !ovSheet) {
-        throw new Error('Database of overzicht ontbreekt.')
-      }
-
-      const dbRows = XLSX.utils.sheet_to_json(dbSheet, { header: 1, defval: '' })
-      const ovRows = XLSX.utils.sheet_to_json(ovSheet, { header: 1, defval: '' })
-      if (dbRows.length < 2 || ovRows.length < 2) {
-        throw new Error('Niet genoeg rijen om data te kopieren.')
-      }
-
-      const dbHeaders = dbRows[1].map((value) => String(value ?? '').trim())
-      const ovHeaders = ovRows[0].map((value) => String(value ?? '').trim())
-      const ovHeaderMap = new Map(
-        ovHeaders.map((header, index) => [normalize(header), index]).filter(([key]) => key)
-      )
-      const dataRowCount = ovRows.length - 1
-      const dbDataRowCount = Math.max(dbRows.length - 2, 0)
-      const maxRows = Math.max(dataRowCount, dbDataRowCount)
-      const dateExportCol = getColumnIndex(dbHeaders, 'Date export')
-      const stationCol = getColumnIndex(dbHeaders, 'Station')
-
-      for (let rowIndex = 0; rowIndex < maxRows; rowIndex += 1) {
-        const ovRow = ovRows[rowIndex + 1] || []
-        const dbRowIndex = rowIndex + 2
-
-        dbHeaders.forEach((header, colIndex) => {
-          const ovColIndex = ovHeaderMap.get(normalize(header))
-          if (ovColIndex === undefined || ovColIndex === null || ovColIndex === -1) return
-          const value = rowIndex < dataRowCount ? ovRow[ovColIndex] : ''
-          setCellValue(dbSheet, dbRowIndex, colIndex, value)
-        })
-
-        if (dateExportCol !== -1) {
-          setCellValue(
-            dbSheet,
-            dbRowIndex,
-            dateExportCol,
-            rowIndex < dataRowCount ? new Date() : ''
-          )
-        }
-        if (stationCol !== -1) {
-          setCellValue(
-            dbSheet,
-            dbRowIndex,
-            stationCol,
-            rowIndex < dataRowCount ? station || '' : ''
-          )
-        }
-      }
-
-      const range = XLSX.utils.decode_range(dbSheet['!ref'] || 'A1')
-      range.e.r = Math.max(range.e.r, maxRows + 1)
-      range.e.c = Math.max(range.e.c, dbHeaders.length - 1)
-      dbSheet['!ref'] = XLSX.utils.encode_range(range)
-
-      XLSX.writeFile(dbWb, 'Afwijkingen database bijgewerkt.xlsx')
+    addLog('PowerBI concept gestart.')
+    setTimeout(() => {
       setPowerBiReady(true)
-      addLog('PowerBI export gedownload.')
-    } catch (error) {
-      addLog(error instanceof Error ? error.message : 'PowerBI export mislukt.', 'error')
-    } finally {
+      addLog('PowerBI concept gereed. Charts volgen later.')
       setBusyAction('')
-    }
+    }, 400)
   }
 
   const copyToClipboard = async (value) => {
@@ -516,6 +463,154 @@ function App() {
     }
   }
 
+  useEffect(() => {
+    if (activePanel !== 'email') return
+    if (!emailDraft || lastEmailStation !== station) {
+      runEmailDraft()
+    }
+  }, [activePanel, emailDraft, lastEmailStation, station])
+
+  useEffect(() => {
+    if (!showHelp) return
+    const buildHelpItems = () => {
+      const compact = window.innerWidth <= 1024 || window.innerHeight <= 720
+      setIsHelpCompact(compact)
+      const padding = 16
+      const cardWidth = 280
+      const cardGap = 14
+      const clamp = (value, min, max) => Math.min(Math.max(value, min), max)
+      const withRect = (ref) => {
+        if (!ref.current) return null
+        return ref.current.getBoundingClientRect()
+      }
+      const placeCard = (rect, preferLeft = false) => {
+        const roomRight = window.innerWidth - rect.right
+        const roomLeft = rect.left
+        const canPlaceRight = roomRight >= cardWidth + cardGap
+        const canPlaceLeft = roomLeft >= cardWidth + cardGap
+        let left = clamp(rect.left, padding, window.innerWidth - cardWidth - padding)
+        if (preferLeft) {
+          if (canPlaceLeft) {
+            left = rect.left - cardWidth - cardGap
+          } else if (canPlaceRight) {
+            left = rect.right + cardGap
+          }
+        } else if (canPlaceRight) {
+          left = rect.right + cardGap
+        }
+        const top = clamp(rect.top, padding, window.innerHeight - 140)
+        return { left, top }
+      }
+      const nextItems = []
+      const uploadsRect = withRect(uploadsRef)
+      if (uploadsRect) {
+        nextItems.push({
+          id: 'uploads',
+          title: 'Stap 1: Uploads',
+          body: 'Upload het dashboard, de database en het overzicht (drag & drop kan).',
+          ...(compact
+            ? {}
+            : {
+                spot: {
+                  top: uploadsRect.top,
+                  left: uploadsRect.left,
+                  width: uploadsRect.width,
+                  height: uploadsRect.height,
+                },
+                card: placeCard(uploadsRect),
+              }),
+        })
+      }
+      const actionsRect = withRect(actionsRef)
+      if (actionsRect) {
+        nextItems.push({
+          id: 'actions',
+          title: 'Stap 2: Acties',
+          body: 'Klik "Data ophalen" en daarna "Dashboard export" om te downloaden.',
+          ...(compact
+            ? {}
+            : {
+                spot: {
+                  top: actionsRect.top,
+                  left: actionsRect.left,
+                  width: actionsRect.width,
+                  height: actionsRect.height,
+                },
+                card: placeCard(actionsRect),
+              }),
+        })
+      }
+      const toggleRect = withRect(toggleRowRef)
+      if (toggleRect) {
+        nextItems.push({
+          id: 'toggles',
+          title: 'Stap 3: Panels',
+          body: 'Gebruik de toggles om Resultaten, Email, Log of PowerBI te openen.',
+          ...(compact
+            ? {}
+            : {
+                spot: {
+                  top: toggleRect.top,
+                  left: toggleRect.left,
+                  width: toggleRect.width,
+                  height: toggleRect.height,
+                },
+                card: placeCard(toggleRect, true),
+              }),
+        })
+      }
+      const outputRect = withRect(outputRef)
+      if (outputRect) {
+        nextItems.push({
+          id: 'output',
+          title: 'Stap 4: Resultaten',
+          body: 'Bekijk tabellen, kopieer email en controleer het logboek.',
+          ...(compact
+            ? {}
+            : {
+                spot: {
+                  top: outputRect.top,
+                  left: outputRect.left,
+                  width: outputRect.width,
+                  height: outputRect.height,
+                },
+                card: placeCard(outputRect),
+              }),
+        })
+      }
+      if (!compact) {
+        const sorted = [...nextItems].filter((item) => item.card).sort((a, b) => a.card.top - b.card.top)
+        const minGap = 16
+        for (let i = 1; i < sorted.length; i += 1) {
+          const prev = sorted[i - 1].card
+          const current = sorted[i].card
+          if (current.top < prev.top + 140 + minGap) {
+            current.top = prev.top + 140 + minGap
+          }
+        }
+      }
+      setHelpItems(nextItems)
+    }
+    const scheduleUpdate = () => {
+      if (helpRafRef.current != null) return
+      helpRafRef.current = requestAnimationFrame(() => {
+        helpRafRef.current = null
+        buildHelpItems()
+      })
+    }
+    scheduleUpdate()
+    window.addEventListener('resize', scheduleUpdate)
+    window.addEventListener('scroll', scheduleUpdate, true)
+    return () => {
+      window.removeEventListener('resize', scheduleUpdate)
+      window.removeEventListener('scroll', scheduleUpdate, true)
+      if (helpRafRef.current != null) {
+        cancelAnimationFrame(helpRafRef.current)
+        helpRafRef.current = null
+      }
+    }
+  }, [showHelp])
+
   return (
     <div className="app">
       <header className="hero">
@@ -534,7 +629,7 @@ function App() {
         </div>
       </header>
 
-      <section className="panel">
+      <section className="panel" ref={uploadsRef}>
         <div className="panel-header">
           <h2>Uploads</h2>
           <div className="inline-field">
@@ -613,7 +708,7 @@ function App() {
         </div>
       </section>
 
-      <section className="panel">
+      <section className="panel" ref={actionsRef}>
         <div className="panel-header">
           <h2>Acties</h2>
           <div className="panel-actions">
@@ -635,25 +730,19 @@ function App() {
         </div>
         <div className="action-grid">
           <button
-            className="primary"
+            className="ghost"
             type="button"
             onClick={runDataOphalen}
             disabled={!overzichtFile || busyAction === 'data'}
           >
             {busyAction === 'data' ? 'Data ophalen...' : 'Data ophalen'}
           </button>
-          <button className="ghost" type="button" onClick={runEmailDraft}>
-            Email opstellen
-          </button>
           <button
             className="primary"
             type="button"
-            onClick={runPowerBiExport}
-            disabled={!databaseFile || !overzichtFile || busyAction === 'powerbi'}
+            onClick={() => void downloadDashboardExport()}
+            disabled={!achterstalligRows.length && !conceptRows.length && !actiehouders.length}
           >
-            {busyAction === 'powerbi' ? 'PowerBI data...' : 'PowerBI data'}
-          </button>
-          <button className="ghost" type="button" onClick={() => void downloadDashboardExport()}>
             Dashboard export
           </button>
         </div>
@@ -681,12 +770,12 @@ function App() {
         </div>
       </section>
 
-      <section className="panel output-panel">
+      <section className="panel output-panel" ref={outputRef}>
         <div className="panel-header">
           <h2>Resultaten</h2>
           <p className="meta">Afwijkingen achterstallig en concept overzicht.</p>
         </div>
-        <div className="toggle-row">
+        <div className="toggle-row" ref={toggleRowRef}>
           <button
             className="ghost toggle"
             type="button"
@@ -711,6 +800,13 @@ function App() {
             onClick={() => setActivePanel((prev) => (prev === 'log' ? 'none' : 'log'))}
           >
             {activePanel === 'log' ? 'Hide log' : 'Show log'}
+          </button>
+          <button
+            className="ghost toggle"
+            type="button"
+            onClick={() => setActivePanel((prev) => (prev === 'powerbi' ? 'none' : 'powerbi'))}
+          >
+            {activePanel === 'powerbi' ? 'Hide powerbi' : 'Show powerbi'}
           </button>
         </div>
         <div className={`toggle-panel ${activePanel === 'results' ? 'open' : ''}`}>
@@ -790,12 +886,12 @@ function App() {
               </div>
             </div>
 
-            <div className="table-card">
-              <div className="table-header">
-                <h3>Actiehouders</h3>
-                <span className="meta">{actiehouders.length} namen</span>
-              </div>
-              <div className="list-grid">
+          <div className="table-card">
+            <div className="table-header">
+              <h3>Actiehouders</h3>
+              <span className="meta">{actiehouders.length} namen</span>
+            </div>
+            <div className="list-grid">
                 {actiehouders.length ? (
                   actiehouders.map((name) => (
                     <span className="pill" key={name}>
@@ -809,6 +905,7 @@ function App() {
             </div>
             </div>
           </div>
+
         </div>
 
         <div className={`toggle-panel ${activePanel === 'email' ? 'open' : ''}`}>
@@ -876,7 +973,151 @@ function App() {
             </div>
           </div>
         </div>
+
+        <div className={`toggle-panel ${activePanel === 'powerbi' ? 'open' : ''}`}>
+          <div className="panel-body">
+            <div className="table-card">
+              <div className="table-header">
+                <h3>PowerBI (concept)</h3>
+                <span className="meta">{powerBiReady ? 'Gereed' : 'In voorbereiding'}</span>
+              </div>
+              <p className="empty">
+                Dit blok is een placeholder voor charts en visuals. Uploads zijn al geladen,
+                de grafieken volgen later.
+              </p>
+              <div className="chart-grid">
+                <div className="chart-card">
+                  <div className="chart-header">
+                    <span className="chart-title">Openstaande afwijkingen</span>
+                    <span className="meta">Per status</span>
+                  </div>
+                  <div className="chart-bars">
+                    <div className="bar">
+                      <span>Vigerend</span>
+                      <div className="bar-track">
+                        <div className="bar-fill" style={{ width: '70%' }} />
+                      </div>
+                    </div>
+                    <div className="bar">
+                      <span>Concept</span>
+                      <div className="bar-track">
+                        <div className="bar-fill" style={{ width: '45%' }} />
+                      </div>
+                    </div>
+                    <div className="bar">
+                      <span>Afgehandeld</span>
+                      <div className="bar-track">
+                        <div className="bar-fill" style={{ width: '25%' }} />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div className="chart-card">
+                  <div className="chart-header">
+                    <span className="chart-title">Deadlines</span>
+                    <span className="meta">Komende 31 dagen</span>
+                  </div>
+                  <div className="chart-ring">
+                    <div className="ring">
+                      <span>68%</span>
+                    </div>
+                    <div className="ring-legend">
+                      <span>Deadline verlopen</span>
+                      <span>Deadline nadert</span>
+                    </div>
+                  </div>
+                </div>
+                <div className="chart-card">
+                  <div className="chart-header">
+                    <span className="chart-title">Top actiehouders</span>
+                    <span className="meta">Meeste maatregelen</span>
+                  </div>
+                  <ul className="chart-list">
+                    <li>
+                      <span>Actiehouder A</span>
+                      <span>12</span>
+                    </li>
+                    <li>
+                      <span>Actiehouder B</span>
+                      <span>9</span>
+                    </li>
+                    <li>
+                      <span>Actiehouder C</span>
+                      <span>7</span>
+                    </li>
+                  </ul>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
       </section>
+      <div className={`help-fab-wrap ${showHelp ? 'open' : ''}`}>
+        <button
+          className="help-fab"
+          type="button"
+          onClick={() => setShowHelp((prev) => !prev)}
+        >
+          ?
+        </button>
+        <span className="help-fab-label">Hulp nodig? Jonathan van der Gouwe</span>
+      </div>
+      {showHelp ? (
+        <div
+          className={`help-overlay ${isHelpCompact ? 'compact' : ''}`}
+          onClick={() => {
+            setShowHelp(false)
+          }}
+        >
+          <button
+            className="help-close ghost"
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation()
+              setShowHelp(false)
+            }}
+          >
+            Sluiten
+          </button>
+          {isHelpCompact ? (
+            <div
+              className="help-list"
+              onClick={(event) => {
+                event.stopPropagation()
+              }}
+            >
+              {helpItems.map((item) => (
+                <div key={item.id} className="help-card help-card-compact">
+                  <h4>{item.title}</h4>
+                  <p>{item.body}</p>
+                </div>
+              ))}
+            </div>
+          ) : (
+            helpItems.map((item) => (
+              <div key={item.id} className="help-item">
+                <div
+                  className="help-spot"
+                  style={{
+                    top: `${item.spot.top}px`,
+                    left: `${item.spot.left}px`,
+                    width: `${item.spot.width}px`,
+                    height: `${item.spot.height}px`,
+                  }}
+                />
+                <div
+                  className="help-card"
+                  style={{ top: `${item.card.top}px`, left: `${item.card.left}px` }}
+                  onClick={(event) => event.stopPropagation()}
+                >
+                  <h4>{item.title}</h4>
+                  <p>{item.body}</p>
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      ) : null}
     </div>
   )
 }
