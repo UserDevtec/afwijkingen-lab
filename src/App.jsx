@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import ExcelJS from 'exceljs'
+import html2canvas from 'html2canvas'
 import * as XLSX from 'xlsx'
 import './App.css'
 
@@ -155,6 +156,21 @@ const readWorkbook = async (file) => {
   return XLSX.read(buffer, { type: 'array', cellDates: true })
 }
 
+const polarToCartesian = (centerX, centerY, radius, angleInDegrees) => {
+  const angleInRadians = ((angleInDegrees - 90) * Math.PI) / 180.0
+  return {
+    x: centerX + radius * Math.cos(angleInRadians),
+    y: centerY + radius * Math.sin(angleInRadians),
+  }
+}
+
+const describeArc = (x, y, radius, startAngle, endAngle) => {
+  const start = polarToCartesian(x, y, radius, endAngle)
+  const end = polarToCartesian(x, y, radius, startAngle)
+  const largeArcFlag = endAngle - startAngle <= 180 ? '0' : '1'
+  return `M ${start.x} ${start.y} A ${radius} ${radius} 0 ${largeArcFlag} 0 ${end.x} ${end.y}`
+}
+
 function App() {
   const [dashboardFile, setDashboardFile] = useState(null)
   const [databaseFile, setDatabaseFile] = useState(null)
@@ -173,11 +189,14 @@ function App() {
   const [showHelp, setShowHelp] = useState(false)
   const [helpItems, setHelpItems] = useState([])
   const [isHelpCompact, setIsHelpCompact] = useState(false)
+  const [powerBiStats, setPowerBiStats] = useState(null)
+  const [statsDownloading, setStatsDownloading] = useState(false)
   const helpRafRef = useRef(null)
   const uploadsRef = useRef(null)
   const actionsRef = useRef(null)
   const outputRef = useRef(null)
   const toggleRowRef = useRef(null)
+  const statsRef = useRef(null)
 
   const summaryStats = useMemo(
     () => ({
@@ -187,6 +206,51 @@ function App() {
     }),
     [achterstalligRows.length, conceptRows.length, actiehouders.length]
   )
+
+  const powerBiPercent = powerBiStats ? Math.round(powerBiStats.onTimePercent) : 0
+  const powerBiOnTime = powerBiStats ? powerBiStats.validDates - powerBiStats.overdueCount : 0
+  const powerBiOnTimePercent = powerBiStats
+    ? powerBiStats.validDates
+      ? Math.round((powerBiOnTime / powerBiStats.validDates) * 100)
+      : 0
+    : 0
+  const powerBiLatePercent = powerBiStats
+    ? powerBiStats.validDates
+      ? Math.round((powerBiStats.overdueCount / powerBiStats.validDates) * 100)
+      : 0
+    : 0
+  const powerBiLateAngle = powerBiStats
+    ? powerBiStats.validDates
+      ? (powerBiStats.overdueCount / powerBiStats.validDates) * 360
+      : 0
+    : 0
+  const powerBiDisciplineData = powerBiStats
+    ? Array.from(powerBiStats.disciplineTotals?.entries?.() || [])
+        .map(([discipline, totalDays]) => ({
+          discipline,
+          totalDays,
+          count: powerBiStats.disciplineCounts?.get?.(discipline) || 0,
+        }))
+        .map((row) => ({
+          ...row,
+          avgDays: row.count ? row.totalDays / row.count : 0,
+        }))
+        .sort((a, b) => b.avgDays - a.avgDays)
+    : []
+  const powerBiDisciplineMaxCount = powerBiDisciplineData.length
+    ? Math.max(...powerBiDisciplineData.map((row) => row.count), 1)
+    : 1
+  const powerBiDisciplineMaxAvg = powerBiDisciplineData.length
+    ? Math.max(...powerBiDisciplineData.map((row) => row.avgDays), 1)
+    : 1
+  const powerBiDisciplineScaleMax = Math.max(powerBiDisciplineMaxAvg, powerBiDisciplineMaxCount, 1)
+  const powerBiTrafficLabel = powerBiStats
+    ? powerBiStats.traffic === 'red'
+      ? 'Rood'
+      : powerBiStats.traffic === 'orange'
+        ? 'Oranje'
+        : 'Groen'
+    : 'Onbekend'
 
   const addLog = (message, type = 'info') => {
     const timestamp = new Date().toISOString().replace('T', ' ').slice(0, 19)
@@ -295,6 +359,7 @@ function App() {
       setConceptRows(concept)
       setActiehouders(Array.from(actiehouderSet).sort((a, b) => a.localeCompare(b)))
       addLog('Data ophalen afgerond.')
+      await runPowerBiExport()
     } catch (error) {
       addLog(error instanceof Error ? error.message : 'Data ophalen mislukt.', 'error')
     } finally {
@@ -310,14 +375,135 @@ function App() {
   }
 
   const runPowerBiExport = async () => {
-    if (!databaseFile || !overzichtFile) return
-    setBusyAction('powerbi')
+    if (!overzichtFile) return
+    setBusyAction((prev) => (prev ? prev : 'powerbi'))
     addLog('PowerBI concept gestart.')
-    setTimeout(() => {
+    try {
+      const wb = await readWorkbook(overzichtFile)
+      const sheet = wb.Sheets[wb.SheetNames[0]]
+      const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' })
+      if (!rows.length) throw new Error('Geen data gevonden in overzicht.')
+      const headers = rows[0].map((value) => String(value ?? '').trim())
+
+      const colBeoordeling = getColumnIndex(headers, 'Maatregelen beoordeling')
+      const colStatus = getColumnIndex(headers, 'Status (2)')
+      const colPlanned = getColumnIndex(headers, 'Geplande datum klaar')
+      const colDone = getColumnIndex(headers, 'Datum klaar')
+      const colActiehouder = getColumnIndex(headers, 'Actiehouder')
+      const colMaatregel = getColumnIndex(headers, 'Maatregel')
+      const colCode = getColumnIndex(headers, 'Code')
+      const colTitel = getColumnIndex(headers, 'Titel')
+      const colDiscipline = getColumnIndex(headers, 'Veroorzakende Discipline')
+
+      if (
+        [colBeoordeling, colStatus, colPlanned, colDone].some((index) => index === -1)
+      ) {
+        throw new Error('Kolomkoppen ontbreken in overzicht voor PowerBI.')
+      }
+
+      let totalFiltered = 0
+      let validDates = 0
+      let overdueCount = 0
+      let missingDates = 0
+      const onTimeRows = []
+      const lateRows = []
+      const missingRows = []
+      const disciplineTotals = new Map()
+      const disciplineCounts = new Map()
+
+      for (let i = 1; i < rows.length; i += 1) {
+        const row = rows[i]
+        if (!row || row.length === 0) continue
+
+        const beoordeling = String(row[colBeoordeling] ?? '').trim()
+        const status = String(row[colStatus] ?? '').trim()
+        if (
+          normalize(beoordeling) !== normalize('Maatregelen nodig') ||
+          normalize(status) !== normalize('Afgehandeld')
+        ) {
+          continue
+        }
+
+        totalFiltered += 1
+        const plannedDate = parseExcelDate(row[colPlanned])
+        const doneDate = parseExcelDate(row[colDone])
+        const actiehouder = colActiehouder !== -1 ? String(row[colActiehouder] ?? '').trim() : ''
+        const maatregel = colMaatregel !== -1 ? String(row[colMaatregel] ?? '').trim() : ''
+
+        if (!plannedDate || !doneDate) {
+          missingDates += 1
+          missingRows.push({
+            code: colCode !== -1 ? row[colCode] : '',
+            titel: colTitel !== -1 ? row[colTitel] : '',
+            maatregel,
+            actiehouder,
+            geplandeDatum: plannedDate,
+            datumKlaar: doneDate,
+          })
+          continue
+        }
+
+        validDates += 1
+        const rowPayload = {
+          code: colCode !== -1 ? row[colCode] : '',
+          titel: colTitel !== -1 ? row[colTitel] : '',
+          maatregel,
+          actiehouder,
+          geplandeDatum: plannedDate,
+          datumKlaar: doneDate,
+        }
+        if (doneDate > plannedDate) {
+          overdueCount += 1
+          lateRows.push(rowPayload)
+          const diffDays = Math.ceil((doneDate - plannedDate) / 86400000)
+          const discipline = colDiscipline !== -1 ? String(row[colDiscipline] ?? '').trim() : ''
+          if (discipline) {
+            disciplineTotals.set(
+              discipline,
+              (disciplineTotals.get(discipline) || 0) + Math.max(diffDays, 0)
+            )
+            disciplineCounts.set(discipline, (disciplineCounts.get(discipline) || 0) + 1)
+          }
+        } else {
+          onTimeRows.push(rowPayload)
+        }
+
+      }
+
+      const overduePercent = validDates ? (overdueCount / validDates) * 100 : 0
+      const onTimePercent = validDates ? ((validDates - overdueCount) / validDates) * 100 : 0
+      const traffic =
+        onTimePercent <= 35 ? 'red' : onTimePercent < 75 ? 'orange' : 'green'
+
+      setPowerBiStats({
+        totalFiltered,
+        validDates,
+        overdueCount,
+        missingDates,
+        overduePercent,
+        onTimePercent,
+        traffic,
+        onTimeRows,
+        lateRows,
+        missingRows,
+        disciplineTotals,
+        disciplineCounts,
+      })
       setPowerBiReady(true)
-      addLog('PowerBI concept gereed. Charts volgen later.')
-      setBusyAction('')
-    }, 400)
+      addLog('PowerBI data klaar.')
+      if (missingDates > 0) {
+        addLog(
+          `${missingDates} rijen missen Geplande datum klaar of Datum klaar.`,
+          'error'
+        )
+      }
+    } catch (error) {
+      addLog(error instanceof Error ? error.message : 'PowerBI data ophalen mislukt.', 'error')
+      setPowerBiReady(false)
+      setPowerBiStats(null)
+    } finally {
+      setBusyAction((prev) => (prev === 'powerbi' ? '' : prev))
+    }
   }
 
   const copyToClipboard = async (value) => {
@@ -327,6 +513,31 @@ function App() {
       addLog('Tekst gekopieerd naar klembord.')
     } catch (error) {
       addLog('Kopieren mislukt.', 'error')
+    }
+  }
+
+  const downloadStatsImage = async () => {
+    if (!statsRef.current || !powerBiStats || statsDownloading) return
+    setStatsDownloading(true)
+    try {
+      const canvas = await html2canvas(statsRef.current, {
+        backgroundColor: '#ffffff',
+        scale: 2,
+        useCORS: true,
+      })
+      const url = canvas.toDataURL('image/png')
+      const link = document.createElement('a')
+      link.href = url
+      link.download = `Statistieken_${buildTimestamp()}.png`
+      link.rel = 'noopener'
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      addLog('Statistieken afbeelding gedownload.')
+    } catch (error) {
+      addLog('Download statistieken mislukt.', 'error')
+    } finally {
+      setStatsDownloading(false)
     }
   }
 
@@ -441,11 +652,13 @@ function App() {
     if (target === 'database') {
       setDatabaseFile(file)
       setPowerBiReady(false)
+      setPowerBiStats(null)
       return
     }
     if (target === 'overzicht') {
       setOverzichtFile(file)
       setPowerBiReady(false)
+      setPowerBiStats(null)
     }
   }
 
@@ -679,6 +892,7 @@ function App() {
               onChange={(event) => {
                 setDatabaseFile(event.target.files?.[0] || null)
                 setPowerBiReady(false)
+                setPowerBiStats(null)
               }}
             />
             <span className="upload-cta">Kies bestand</span>
@@ -701,6 +915,7 @@ function App() {
               onChange={(event) => {
                 setOverzichtFile(event.target.files?.[0] || null)
                 setPowerBiReady(false)
+                setPowerBiStats(null)
               }}
             />
             <span className="upload-cta">Kies bestand</span>
@@ -721,10 +936,11 @@ function App() {
                 setActiehouders([])
                 setEmailDraft(null)
                 setPowerBiReady(false)
+                setPowerBiStats(null)
                 setLogEntries([])
               }}
             >
-              Reset scherm
+              Verversen
             </button>
           </div>
         </div>
@@ -763,8 +979,8 @@ function App() {
             <p className="stat-note">Unieke namen</p>
           </div>
           <div className="stat-card">
-            <p className="stat-label">PowerBI export</p>
-            <p className="stat-value">{powerBiReady ? 'Klaar' : 'Niet gedaan'}</p>
+            <p className="stat-label">Statistieken</p>
+            <p className="stat-value">{powerBiReady ? 'Gereed' : '-'}</p>
             <p className="stat-note">Download gereed</p>
           </div>
         </div>
@@ -806,7 +1022,7 @@ function App() {
             type="button"
             onClick={() => setActivePanel((prev) => (prev === 'powerbi' ? 'none' : 'powerbi'))}
           >
-            {activePanel === 'powerbi' ? 'Hide powerbi' : 'Show powerbi'}
+            {activePanel === 'powerbi' ? 'Hide statistieken' : 'Show statistieken'}
           </button>
         </div>
         <div className={`toggle-panel ${activePanel === 'results' ? 'open' : ''}`}>
@@ -976,78 +1192,335 @@ function App() {
 
         <div className={`toggle-panel ${activePanel === 'powerbi' ? 'open' : ''}`}>
           <div className="panel-body">
-            <div className="table-card">
+            <div className="table-card" ref={statsRef}>
               <div className="table-header">
-                <h3>PowerBI (concept)</h3>
-                <span className="meta">{powerBiReady ? 'Gereed' : 'In voorbereiding'}</span>
-              </div>
-              <p className="empty">
-                Dit blok is een placeholder voor charts en visuals. Uploads zijn al geladen,
-                de grafieken volgen later.
-              </p>
-              <div className="chart-grid">
-                <div className="chart-card">
-                  <div className="chart-header">
-                    <span className="chart-title">Openstaande afwijkingen</span>
-                    <span className="meta">Per status</span>
-                  </div>
-                  <div className="chart-bars">
-                    <div className="bar">
-                      <span>Vigerend</span>
-                      <div className="bar-track">
-                        <div className="bar-fill" style={{ width: '70%' }} />
-                      </div>
-                    </div>
-                    <div className="bar">
-                      <span>Concept</span>
-                      <div className="bar-track">
-                        <div className="bar-fill" style={{ width: '45%' }} />
-                      </div>
-                    </div>
-                    <div className="bar">
-                      <span>Afgehandeld</span>
-                      <div className="bar-track">
-                        <div className="bar-fill" style={{ width: '25%' }} />
-                      </div>
-                    </div>
-                  </div>
+                <div className="header-stack">
+                  <h3>Statistieken</h3>
+                  <span className="meta">
+                    {new Date().toLocaleString('nl-NL', {
+                      dateStyle: 'short',
+                      timeStyle: 'short',
+                    })}
+                  </span>
                 </div>
-                <div className="chart-card">
-                  <div className="chart-header">
-                    <span className="chart-title">Deadlines</span>
-                    <span className="meta">Komende 31 dagen</span>
+                <button
+                  className="icon-button"
+                  type="button"
+                  onClick={downloadStatsImage}
+                  disabled={!powerBiStats || statsDownloading}
+                  aria-label="Download statistieken"
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M12 3a1 1 0 0 1 1 1v8.59l2.3-2.3a1 1 0 1 1 1.4 1.42l-4 4a1 1 0 0 1-1.4 0l-4-4a1 1 0 0 1 1.4-1.42l2.3 2.3V4a1 1 0 0 1 1-1z" />
+                    <path d="M5 19a1 1 0 0 1 1-1h12a1 1 0 1 1 0 2H6a1 1 0 0 1-1-1z" />
+                  </svg>
+                </button>
+              </div>
+              {powerBiStats ? (
+                <div className="stats-capture">
+                <div className="chart-grid">
+                  <div className="chart-card">
+                    <div className="chart-header">
+                      <span className="chart-title">Stoplicht chart</span>
+                      <span className="meta">{powerBiPercent}%</span>
+                    </div>
+                    <div className="gauge">
+                      <svg className="gauge-svg" viewBox="0 0 200 120" aria-hidden="true">
+                        <path
+                          d="M 20 100 A 80 80 0 0 1 180 100"
+                          className="gauge-segment red"
+                          pathLength="100"
+                        />
+                        <path
+                          d="M 20 100 A 80 80 0 0 1 180 100"
+                          className="gauge-segment orange"
+                          pathLength="100"
+                        />
+                        <path
+                          d="M 20 100 A 80 80 0 0 1 180 100"
+                          className="gauge-segment green"
+                          pathLength="100"
+                        />
+                        <line
+                          x1="100"
+                          y1="100"
+                          x2={polarToCartesian(100, 100, 62, -90 + powerBiPercent * 1.8).x}
+                          y2={polarToCartesian(100, 100, 62, -90 + powerBiPercent * 1.8).y}
+                          className="gauge-needle"
+                        />
+                        <circle cx="100" cy="100" r="10" className="gauge-cap" />
+                      </svg>
+                      <div className="gauge-value">{powerBiPercent}</div>
+                    </div>
+                    <div className="gauge-legend">
+                      <span className="legend-chip red">{'<= 35%'}</span>
+                      <span className="legend-chip orange">{'< 75%'}</span>
+                      <span className="legend-chip green">{'>= 75%'}</span>
+                    </div>
                   </div>
-                  <div className="chart-ring">
-                    <div className="ring">
-                      <span>68%</span>
+                  <div className="chart-card">
+                    <div className="chart-header">
+                      <span className="chart-title">Planning gereed chart</span>
+                      <span className="meta">{powerBiStats.validDates} rijen</span>
+                    </div>
+                    <div className="pie-wrap">
+                      <svg
+                        className="pie-svg"
+                        viewBox="0 0 140 140"
+                        preserveAspectRatio="xMidYMid meet"
+                        aria-hidden="true"
+                      >
+                        {powerBiLateAngle > 0 && powerBiLateAngle < 360 ? (
+                          <path
+                            className="pie-bg"
+                            d={describeArc(70, 70, 46, powerBiLateAngle, 360)}
+                          />
+                        ) : powerBiLateAngle <= 0 ? (
+                          <circle className="pie-bg" cx="70" cy="70" r="46" />
+                        ) : null}
+                        {powerBiLateAngle >= 360 ? (
+                          <circle className="pie-slice" cx="70" cy="70" r="46" />
+                        ) : powerBiLateAngle > 0 ? (
+                          <path
+                            className="pie-slice"
+                            d={describeArc(70, 70, 46, 0, powerBiLateAngle)}
+                          />
+                        ) : null}
+                      </svg>
+                      <div className="pie-legend">
+                        <span className="legend-row">
+                          <span className="legend-dot red" />
+                          Te laat: {powerBiStats.overdueCount}
+                        </span>
+                        <span className="legend-row">
+                          <span className="legend-dot green" />
+                          Op tijd: {powerBiOnTime}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                  <div className="chart-card">
+                    <div className="chart-header">
+                      <span className="chart-title">Details</span>
                     </div>
                     <div className="ring-legend">
-                      <span>Deadline verlopen</span>
-                      <span>Deadline nadert</span>
+                      <span>Gefilterd: {powerBiStats.totalFiltered}</span>
+                      <span>Geldige datums: {powerBiStats.validDates}</span>
+                      <span>Overschreden: {powerBiStats.overdueCount}</span>
+                      <span>Op tijd: {powerBiOnTime}</span>
+                      <span>Ontbrekend: {powerBiStats.missingDates}</span>
                     </div>
                   </div>
                 </div>
-                <div className="chart-card">
+                <div className="chart-card wide-chart">
                   <div className="chart-header">
-                    <span className="chart-title">Top actiehouders</span>
-                    <span className="meta">Meeste maatregelen</span>
+                    <span className="chart-title">Veroorzakende discipline</span>
+                    <span className="meta">Gem. dagen te laat + aantal</span>
                   </div>
-                  <ul className="chart-list">
-                    <li>
-                      <span>Actiehouder A</span>
-                      <span>12</span>
-                    </li>
-                    <li>
-                      <span>Actiehouder B</span>
-                      <span>9</span>
-                    </li>
-                    <li>
-                      <span>Actiehouder C</span>
-                      <span>7</span>
-                    </li>
-                  </ul>
+                  {powerBiDisciplineData.length ? (
+                    <div className="discipline-chart">
+                      <div className="discipline-legend">
+                        <span className="legend-row">
+                          <span className="legend-dot blue" />
+                          Gemiddeld dagen te laat
+                        </span>
+                        <span className="legend-row">
+                          <span className="legend-dot navy" />
+                          Aantal afwijkingen
+                        </span>
+                      </div>
+                      <div className="discipline-bars-wrap">
+                        <div className="discipline-axis">
+                          {[1, 0.75, 0.5, 0.25, 0].map((tick) => (
+                            <div className="axis-tick" key={tick}>
+                              <span className="axis-label">
+                                {Math.round(powerBiDisciplineScaleMax * tick)}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                        <div className="discipline-bars">
+                          {powerBiDisciplineData.map((item) => (
+                            <div className="discipline-bar" key={item.discipline}>
+                              <div
+                                className="bar-pair"
+                                data-tooltip={`Gemiddeld dagen te laat: ${Math.round(
+                                  item.avgDays
+                                )}\nAantal afwijkingen: ${item.count}`}
+                              >
+                                <span
+                                  className="bar-avg"
+                                  style={{
+                                    height: `${(item.avgDays / powerBiDisciplineScaleMax) * 100}%`,
+                                  }}
+                                />
+                                <span
+                                  className="bar-count"
+                                  style={{
+                                    height: `${(item.count / powerBiDisciplineScaleMax) * 100}%`,
+                                  }}
+                                />
+                              </div>
+                              <span className="bar-label" title={item.discipline}>
+                                {item.discipline}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="empty">Geen discipline-data beschikbaar.</p>
+                  )}
                 </div>
-              </div>
+                <div className="table-card mini-table">
+                  <div className="table-header">
+                    <h3>Planning gereed overzicht</h3>
+                    <span className="meta">Geldige datums: {powerBiStats.validDates}</span>
+                  </div>
+                  <div className="table-scroll">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Status</th>
+                          <th>Aantal</th>
+                          <th>Percentage</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr>
+                          <td>Op tijd</td>
+                          <td>{powerBiOnTime}</td>
+                          <td>{powerBiOnTimePercent}%</td>
+                        </tr>
+                        <tr>
+                          <td>Te laat</td>
+                          <td>{powerBiStats.overdueCount}</td>
+                          <td>{powerBiLatePercent}%</td>
+                        </tr>
+                        <tr>
+                          <td>Ontbrekend</td>
+                          <td>{powerBiStats.missingDates}</td>
+                          <td>-</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+                <div className="table-card mini-table">
+                  <div className="table-header">
+                    <h3>Op tijd</h3>
+                    <span className="meta">{powerBiStats.onTimeRows.length} rijen</span>
+                  </div>
+                  <div className="table-scroll">
+                    {powerBiStats.onTimeRows.length ? (
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>Code</th>
+                            <th>Titel</th>
+                            <th>Maatregel</th>
+                            <th>Actiehouder</th>
+                            <th>Geplande datum</th>
+                            <th>Datum klaar</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {powerBiStats.onTimeRows.map((row, index) => (
+                            <tr key={`ontime-${index}`}>
+                              <td>{row.code}</td>
+                              <td>{row.titel}</td>
+                              <td>{row.maatregel}</td>
+                              <td>{row.actiehouder}</td>
+                              <td>{formatDate(row.geplandeDatum)}</td>
+                              <td>{formatDate(row.datumKlaar)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    ) : (
+                      <p className="empty">Geen op tijd regels.</p>
+                    )}
+                  </div>
+                </div>
+                <div className="table-card mini-table">
+                  <div className="table-header">
+                    <h3>Te laat</h3>
+                    <span className="meta">{powerBiStats.lateRows.length} rijen</span>
+                  </div>
+                  <div className="table-scroll">
+                    {powerBiStats.lateRows.length ? (
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>Code</th>
+                            <th>Titel</th>
+                            <th>Maatregel</th>
+                            <th>Actiehouder</th>
+                            <th>Geplande datum</th>
+                            <th>Datum klaar</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {powerBiStats.lateRows.map((row, index) => (
+                            <tr key={`late-${index}`}>
+                              <td>{row.code}</td>
+                              <td>{row.titel}</td>
+                              <td>{row.maatregel}</td>
+                              <td>{row.actiehouder}</td>
+                              <td>{formatDate(row.geplandeDatum)}</td>
+                              <td>{formatDate(row.datumKlaar)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    ) : (
+                      <p className="empty">Geen te laat regels.</p>
+                    )}
+                  </div>
+                </div>
+                <div className="table-card mini-table">
+                  <div className="table-header">
+                    <h3>Ontbrekende datums</h3>
+                    <span className="meta">{powerBiStats.missingRows.length} rijen</span>
+                  </div>
+                  <div className="table-scroll">
+                    {powerBiStats.missingRows.length ? (
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>Code</th>
+                            <th>Titel</th>
+                            <th>Maatregel</th>
+                            <th>Actiehouder</th>
+                            <th>Geplande datum</th>
+                            <th>Datum klaar</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {powerBiStats.missingRows.map((row, index) => (
+                            <tr key={`missing-${index}`}>
+                              <td>{row.code}</td>
+                              <td>{row.titel}</td>
+                              <td>{row.maatregel}</td>
+                              <td>{row.actiehouder}</td>
+                              <td>{formatDate(row.geplandeDatum)}</td>
+                              <td>{formatDate(row.datumKlaar)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    ) : (
+                      <p className="empty">Geen ontbrekende datums.</p>
+                    )}
+                  </div>
+                </div>
+                </div>
+              ) : (
+                <p className="empty">
+                  Klik op "Data ophalen" om de statistieken te visualiseren.
+                </p>
+              )}
             </div>
           </div>
         </div>
